@@ -64,7 +64,7 @@ private:
                                  CheckerContext &C) const;
   void reportLeakedVALists(const RegionVector &LeakedVALists, StringRef Msg1,
                            StringRef Msg2, CheckerContext &C, ExplodedNode *N,
-                           bool ForceReport = false) const;
+                           bool ReportUninit = false) const;
 
   void checkVAListStartCall(const CallEvent &Call, CheckerContext &C,
                             bool IsCopy) const;
@@ -189,7 +189,7 @@ void ValistChecker::checkPreStmt(const VAArgExpr *VAA,
                                  CheckerContext &C) const {
   ProgramStateRef State = C.getState();
   const Expr *VASubExpr = VAA->getSubExpr();
-  SVal VAListSVal = State->getSVal(VASubExpr, C.getLocationContext());
+  SVal VAListSVal = C.getSVal(VASubExpr);
   bool Symbolic;
   const MemRegion *VAList =
       getVAListAsRegion(VAListSVal, VASubExpr, Symbolic, C);
@@ -256,7 +256,7 @@ void ValistChecker::reportUninitializedAccess(const MemRegion *VAList,
     if (!BT_uninitaccess)
       BT_uninitaccess.reset(new BugType(CheckNames[CK_Uninitialized],
                                         "Uninitialized va_list",
-                                        "Memory Error"));
+                                        categories::MemoryError));
     auto R = llvm::make_unique<BugReport>(*BT_uninitaccess, Msg, N);
     R->markInteresting(VAList);
     R->addVisitor(llvm::make_unique<ValistBugVisitor>(VAList));
@@ -267,14 +267,19 @@ void ValistChecker::reportUninitializedAccess(const MemRegion *VAList,
 void ValistChecker::reportLeakedVALists(const RegionVector &LeakedVALists,
                                         StringRef Msg1, StringRef Msg2,
                                         CheckerContext &C, ExplodedNode *N,
-                                        bool ForceReport) const {
+                                        bool ReportUninit) const {
   if (!(ChecksEnabled[CK_Unterminated] ||
-        (ChecksEnabled[CK_Uninitialized] && ForceReport)))
+        (ChecksEnabled[CK_Uninitialized] && ReportUninit)))
     return;
   for (auto Reg : LeakedVALists) {
     if (!BT_leakedvalist) {
-      BT_leakedvalist.reset(new BugType(CheckNames[CK_Unterminated],
-                                        "Leaked va_list", "Memory Error"));
+      // FIXME: maybe creating a new check name for this type of bug is a better
+      // solution.
+      BT_leakedvalist.reset(
+          new BugType(CheckNames[CK_Unterminated].getName().empty()
+                          ? CheckNames[CK_Uninitialized]
+                          : CheckNames[CK_Unterminated],
+                      "Leaked va_list", categories::MemoryError));
       BT_leakedvalist->setSuppressOnSink(true);
     }
 
@@ -374,7 +379,7 @@ void ValistChecker::checkVAListEndCall(const CallEvent &Call,
 
 std::shared_ptr<PathDiagnosticPiece> ValistChecker::ValistBugVisitor::VisitNode(
     const ExplodedNode *N, const ExplodedNode *PrevN, BugReporterContext &BRC,
-    BugReport &BR) {
+    BugReport &) {
   ProgramStateRef State = N->getState();
   ProgramStateRef StatePrev = PrevN->getState();
 

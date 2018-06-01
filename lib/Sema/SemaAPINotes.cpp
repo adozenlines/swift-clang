@@ -21,14 +21,21 @@ namespace {
     IsNotActive,
     IsActive
   };
+  enum IsReplacement_t : bool {
+    IsNotReplacement,
+    IsReplacement
+  };
 
   struct VersionedInfoMetadata {
     /// An empty version refers to unversioned metadata.
     VersionTuple Version;
-    bool IsActive;
+    unsigned IsActive: 1;
+    unsigned IsReplacement: 1;
 
-    VersionedInfoMetadata(VersionTuple version, IsActive_t active)
-        : Version(version), IsActive(active == IsActive_t::IsActive) {}
+    VersionedInfoMetadata(VersionTuple version, IsActive_t active,
+                          IsReplacement_t replacement)
+      : Version(version), IsActive(active == IsActive_t::IsActive),
+        IsReplacement(replacement == IsReplacement_t::IsReplacement) {}
   };
 } // end anonymous namespace
 
@@ -141,18 +148,16 @@ namespace {
          Sema &S, Decl *D, bool shouldAddAttribute,
          VersionedInfoMetadata metadata,
          llvm::function_ref<A *()> createAttr,
-         llvm::function_ref<specific_attr_iterator<A>(Decl*)> getExistingAttr) {
+         llvm::function_ref<Decl::attr_iterator(const Decl*)> getExistingAttr) {
     if (metadata.IsActive) {
-      auto end = D->specific_attr_end<A>();
       auto existing = getExistingAttr(D);
-      if (existing != end) {
+      if (existing != D->attr_end()) {
         // Remove the existing attribute, and treat it as a superseded
         // non-versioned attribute.
-        auto *versioned =
-            SwiftVersionedAttr::CreateImplicit(S.Context, clang::VersionTuple(),
-                                               *existing);
+        auto *versioned = SwiftVersionedAttr::CreateImplicit(
+            S.Context, metadata.Version, *existing, /*IsReplacedByActive*/true);
 
-        D->getAttrs().erase(existing.getCurrent());
+        D->getAttrs().erase(existing);
         D->addAttr(versioned);
       }
 
@@ -166,19 +171,18 @@ namespace {
     } else {
       if (shouldAddAttribute) {
         if (auto attr = createAttr()) {
-          auto *versioned =
-              SwiftVersionedAttr::CreateImplicit(S.Context, metadata.Version, 
-                                                 attr);
+          auto *versioned = SwiftVersionedAttr::CreateImplicit(
+              S.Context, metadata.Version, attr,
+              /*IsReplacedByActive*/metadata.IsReplacement);
           D->addAttr(versioned);
         }
       } else {
         // FIXME: This isn't preserving enough information for things like
         // availability, where we're trying to remove a /specific/ kind of
         // attribute.
-        auto *versioned =
-            SwiftVersionedRemovalAttr::CreateImplicit(S.Context, 
-                                                      metadata.Version,
-                                                      AttrKindFor<A>::value);
+        auto *versioned = SwiftVersionedRemovalAttr::CreateImplicit(
+            S.Context,  metadata.Version, AttrKindFor<A>::value,
+            /*IsReplacedByActive*/metadata.IsReplacement);
         D->addAttr(versioned);
       }
     }
@@ -190,9 +194,58 @@ namespace {
          VersionedInfoMetadata metadata,
          llvm::function_ref<A *()> createAttr) {
     handleAPINotedAttribute<A>(S, D, shouldAddAttribute, metadata, createAttr,
-    [](Decl *decl) {
-        return decl->specific_attr_begin<A>();
+                               [](const Decl *decl) {
+      return llvm::find_if(decl->attrs(), [](const Attr *next) {
+        return isa<A>(next);
+      });
     });
+  }
+}
+
+template <typename A = CFReturnsRetainedAttr>
+static void handleAPINotedRetainCountAttribute(Sema &S, Decl *D,
+                                               bool shouldAddAttribute,
+                                               VersionedInfoMetadata metadata) {
+  // The template argument has a default to make the "removal" case more
+  // concise; it doesn't matter /which/ attribute is being removed.
+  handleAPINotedAttribute<A>(S, D, shouldAddAttribute, metadata, [&] {
+    return A::CreateImplicit(S.Context);
+  }, [](const Decl *D) -> Decl::attr_iterator {
+    return llvm::find_if(D->attrs(), [](const Attr *next) -> bool {
+      return isa<CFReturnsRetainedAttr>(next) ||
+             isa<CFReturnsNotRetainedAttr>(next) ||
+             isa<NSReturnsRetainedAttr>(next) ||
+             isa<NSReturnsNotRetainedAttr>(next);
+    });
+  });
+}
+
+static void handleAPINotedRetainCountConvention(
+    Sema &S, Decl *D, VersionedInfoMetadata metadata,
+    Optional<api_notes::RetainCountConventionKind> convention) {
+  if (!convention)
+    return;
+  switch (convention.getValue()) {
+  case api_notes::RetainCountConventionKind::None:
+    handleAPINotedRetainCountAttribute(S, D, /*shouldAddAttribute*/false,
+                                       metadata);
+    break;
+  case api_notes::RetainCountConventionKind::CFReturnsRetained:
+    handleAPINotedRetainCountAttribute<CFReturnsRetainedAttr>(
+        S, D, /*shouldAddAttribute*/true, metadata);
+    break;
+  case api_notes::RetainCountConventionKind::CFReturnsNotRetained:
+    handleAPINotedRetainCountAttribute<CFReturnsNotRetainedAttr>(
+        S, D, /*shouldAddAttribute*/true, metadata);
+    break;
+  case api_notes::RetainCountConventionKind::NSReturnsRetained:
+    handleAPINotedRetainCountAttribute<NSReturnsRetainedAttr>(
+        S, D, /*shouldAddAttribute*/true, metadata);
+    break;
+  case api_notes::RetainCountConventionKind::NSReturnsNotRetained:
+    handleAPINotedRetainCountAttribute<NSReturnsNotRetainedAttr>(
+        S, D, /*shouldAddAttribute*/true, metadata);
+    break;
   }
 }
 
@@ -222,19 +275,16 @@ static void ProcessAPINotes(Sema &S, Decl *D,
                    /*Strict=*/false,
                    /*Replacement=*/StringRef());
     },
-    [](Decl *decl) {
-      auto existing = decl->specific_attr_begin<AvailabilityAttr>(),
-        end = decl->specific_attr_end<AvailabilityAttr>();
-      while (existing != end) {
-        if (auto platform = (*existing)->getPlatform()) {
-          if (platform->isStr("swift"))
-            break;
-        }
-
-        ++existing;
-      }
-
-      return existing;
+    [](const Decl *decl) {
+      return llvm::find_if(decl->attrs(), [](const Attr *next) -> bool {
+        auto *AA = dyn_cast<AvailabilityAttr>(next);
+        if (!AA)
+          return false;
+        const IdentifierInfo *platform = AA->getPlatform();
+        if (!platform)
+          return false;
+        return platform->isStr("swift");
+      });
     });
   }
 
@@ -368,6 +418,10 @@ static void ProcessAPINotes(Sema &S, ParmVarDecl *D,
     });
   }
 
+  // Retain count convention
+  handleAPINotedRetainCountConvention(S, D, metadata,
+                                      info.getRetainCountConvention());
+
   // Handle common entity information.
   ProcessAPINotes(S, D, static_cast<const api_notes::VariableInfo &>(info),
                   metadata);
@@ -497,6 +551,10 @@ static void ProcessAPINotes(Sema &S, FunctionOrMethod AnyFunc,
                                                fnNoProtoType->getExtInfo()));
     }
   }
+
+  // Retain count convention
+  handleAPINotedRetainCountConvention(S, D, metadata,
+                                      info.getRetainCountConvention());
 
   // Handle common entity information.
   ProcessAPINotes(S, D, static_cast<const api_notes::CommonEntityInfo &>(info),
@@ -649,6 +707,50 @@ static void ProcessAPINotes(Sema &S, ObjCInterfaceDecl *D,
                   metadata);
 }
 
+/// If we're applying API notes with an active, non-default version, and the
+/// versioned API notes have a SwiftName but the declaration normally wouldn't
+/// have one, add a removal attribute to make it clear that the new SwiftName
+/// attribute only applies to the active version of \p D, not to all versions.
+///
+/// This must be run \em before processing API notes for \p D, because otherwise
+/// any existing SwiftName attribute will have been packaged up in a 
+/// SwiftVersionedAttr.
+template <typename SpecificInfo>
+static void maybeAttachUnversionedSwiftName(
+    Sema &S, Decl *D,
+    const api_notes::APINotesReader::VersionedInfo<SpecificInfo> Info) {
+  if (D->hasAttr<SwiftNameAttr>())
+    return;
+  if (!Info.getSelected())
+    return;
+
+  // Is the active slice versioned, and does it set a Swift name?
+  VersionTuple SelectedVersion;
+  SpecificInfo SelectedInfoSlice;
+  std::tie(SelectedVersion, SelectedInfoSlice) = Info[*Info.getSelected()];
+  if (SelectedVersion.empty())
+    return;
+  if (SelectedInfoSlice.SwiftName.empty())
+    return;
+
+  // Does the unversioned slice /not/ set a Swift name?
+  for (const auto &VersionAndInfoSlice : Info) {
+    if (!VersionAndInfoSlice.first.empty())
+      continue;
+    if (!VersionAndInfoSlice.second.SwiftName.empty())
+      return;
+  }
+
+  // Then explicitly call that out with a removal attribute.
+  VersionedInfoMetadata DummyFutureMetadata(SelectedVersion, IsNotActive,
+                                            IsReplacement);
+  handleAPINotedAttribute<SwiftNameAttr>(S, D, /*add*/false,
+                                         DummyFutureMetadata,
+                                         []() -> SwiftNameAttr * {
+    llvm_unreachable("should not try to add an attribute here");
+  });
+}
+
 /// Processes all versions of versioned API notes.
 ///
 /// Just dispatches to the various ProcessAPINotes functions in this file.
@@ -656,6 +758,9 @@ template <typename SpecificDecl, typename SpecificInfo>
 static void ProcessVersionedAPINotes(
     Sema &S, SpecificDecl *D,
     const api_notes::APINotesReader::VersionedInfo<SpecificInfo> Info) {
+
+  maybeAttachUnversionedSwiftName(S, D, Info);
+
   unsigned Selected = Info.getSelected().getValueOr(Info.size());
 
   VersionTuple Version;
@@ -663,7 +768,13 @@ static void ProcessVersionedAPINotes(
   for (unsigned i = 0, e = Info.size(); i != e; ++i) {
     std::tie(Version, InfoSlice) = Info[i];
     auto Active = (i == Selected) ? IsActive : IsNotActive;
-    ProcessAPINotes(S, D, InfoSlice, VersionedInfoMetadata(Version, Active));
+    auto Replacement = IsNotReplacement;
+    if (Active == IsNotActive && Version.empty()) {
+      Replacement = IsReplacement;
+      Version = Info[Selected].first;
+    }
+    ProcessAPINotes(S, D, InfoSlice, VersionedInfoMetadata(Version, Active,
+                                                           Replacement));
   }
 }
 

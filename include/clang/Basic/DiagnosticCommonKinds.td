@@ -90,12 +90,16 @@ def err_module_unavailable : Error<
   "module '%0' %select{is incompatible with|requires}1 feature '%2'">;
 def err_module_header_missing : Error<
   "%select{|umbrella }0header '%1' not found">;
-def err_module_shadowed : Error<
-  "import of shadowed module '%0'">;
 def remark_module_lock_failure : Remark<
   "could not acquire lock file for module '%0': %1">, InGroup<ModuleBuild>;
 def remark_module_lock_timeout : Remark<
   "timed out waiting to acquire lock file for module '%0'">, InGroup<ModuleBuild>;
+def err_module_shadowed : Error<
+  "import of shadowed module '%0'">;
+def err_module_lock_failure : Error<
+  "could not acquire lock file for module '%0': %1">, DefaultFatal;
+def err_module_lock_timeout : Error<
+  "timed out waiting to acquire lock file for module '%0'">, DefaultFatal;
 def err_module_cycle : Error<"cyclic dependency in module '%0': %1">, 
   DefaultFatal;
 def err_module_prebuilt : Error<
@@ -187,6 +191,8 @@ def note_invalid_subexpr_in_const_expr : Note<
 def err_target_unknown_triple : Error<
   "unknown target triple '%0', please use -triple or -arch">;
 def err_target_unknown_cpu : Error<"unknown target CPU '%0'">;
+def err_target_unsupported_cpu_for_micromips : Error<
+  "micromips is not supported for target CPU '%0'">;
 def err_target_unknown_abi : Error<"unknown target ABI '%0'">;
 def err_target_unsupported_abi : Error<"ABI '%0' is not supported on CPU '%1'">;
 def err_target_unsupported_abi_for_triple : Error<
